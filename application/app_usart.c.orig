@@ -1,0 +1,113 @@
+#include "main.h"
+#include "usart.h"
+#include "app_usart.h"
+#include "app_can.h"
+#include "string.h"
+#include "math.h"
+u8 rec_data1;
+u8 rec_data5;
+gyro angle;
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+
+    if(huart->Instance == USART1)
+    {
+        Judge_Data(rec_data1);//处理数据
+        HAL_UART_Receive_IT(&huart1, (u8 *)&rec_data1, 1);//再次开启串口接收数据
+    }
+    if(huart->Instance == UART5)
+    {
+        Judge_Data(rec_data5);//处理数据
+        HAL_UART_Receive_IT(&huart5, (u8 *)&rec_data5, 1);//再次开启串口接收数据
+    }
+}
+
+void Judge_Data(u8 ucData)
+{
+    static u8 ucRxBuffer[250];
+    static u8 ucRxCnt = 0;
+    ucRxBuffer[ucRxCnt++] = ucData;	//将收到的数据存入缓冲区中
+    if (ucRxBuffer[0] != 0x55) //数据头不对，则重新开始寻找0x55数据头
+    {
+        ucRxCnt = 0;
+        return;
+    }
+	if (ucRxCnt<11) {return;}//数据不满11个，则返回
+	else
+	{
+		switch(ucRxBuffer[1])//判断数据是哪种数据，然后将其拷贝到对应的结构体中，有些数据包需要通过上位机打开对应的输出后，才能接收到这个数据包的数据
+		{
+      //memcpy为编译器自带的内存拷贝函数，需引用"string.h"，将接收缓冲区的字符拷贝到数据结构体里面，从而实现数据的解析。
+			case 0x52://角速度
+      {
+          angle.Rollspeed= (short)(ucRxBuffer[3]<<8|ucRxBuffer[2])*2000/32768;
+          angle.Pitchspeed=(short)(ucRxBuffer[5]<<8|ucRxBuffer[4])*2000/32768;
+          angle.Yawspeed=  (short)(ucRxBuffer[7]<<8|ucRxBuffer[6])*2000/32768;
+      }break;
+			case 0x53://角度
+      {
+          angle.Roll= (short)(ucRxBuffer[3]<<8|ucRxBuffer[2])*180/32768;
+          angle.Pitch=(short)(ucRxBuffer[5]<<8|ucRxBuffer[4])*180/32768;
+          angle.Yaw=  (short)(ucRxBuffer[7]<<8|ucRxBuffer[6])*180/32768;
+      }break;
+			default:break;
+		}
+		ucRxCnt=0;//清空缓存区
+	}
+}
+
+//串口1发送一个字符
+void uart1SendChar(u8 ch)
+{
+    while((USART1->SR & 0x40) == 0);
+
+    USART1->DR = (u8) ch;
+}
+/****************************************************************************
+* 名    称: void uart1SendChars(u8 *str, u16 strlen)
+* 功    能：串口1发送一字符串
+* 入口参数：*str：发送的字符串
+            strlen：字符串长度
+* 返回参数：无
+* 说    明：
+****************************************************************************/
+void uart1SendChars(u8 *str, u16 strlen)
+{
+    u16 k = 0 ;
+
+    do
+    {
+        uart1SendChar(*(str + k));    //循环发送,直到发送完毕
+        k++;
+    }
+    while (k < strlen);
+}
+
+void uart1_Display(short num, int ch)
+{
+    int i;
+    u8  tempbuf[20] = {0};
+    short data[10] = {0};
+    tempbuf[0] = 'J';
+    tempbuf[1] = 'D';
+
+    if(num < 0)
+    {
+        num = -num;					    //转为正数
+        tempbuf[2] = '-';
+    }
+    else
+    {
+        tempbuf[2] = '+';
+    }
+
+    for(i = 3; i <= ch + 2; i++)
+    {
+        data[i] = pow(10, ch + 2 - i);
+        tempbuf[i] = (num / data[i]) % 10 + '0';
+    }
+
+    tempbuf[ch + 4] = 'E';
+    uart1SendChars(tempbuf, ch + 5);
+}
+

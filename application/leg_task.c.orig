@@ -1,0 +1,51 @@
+#include "stm32_pca9685.h"
+#include "delay.h"
+#include "math.h"
+#include "leg_task.h"
+
+LEG_typedef horse[4]={0};
+Footend_typedef foot[4]={0};
+
+double X_coordinate[4]={0};
+double Y_coordinate[4]={0};
+double Z_coordinate[4]={0};
+//足端摆线
+void Foot_cycloid(double X_coord,double Y_coord,float cycle,float arr,float Y_start,float Y_end,float Z_start,float hight)
+{
+	static float b;
+	b=foot[0].t+0.01;
+	foot[0].cycle	= cycle;	foot[0].arr = arr;	foot[0].hight = hight;	foot[0].Y_start=Y_start;
+	foot[0].Y_end=Y_end;    foot[0].Z_start=Z_start;
+	/*********************************************************/
+	foot[0].sigma =(2*pi*foot[0].t)/(foot[0].arr*foot[0].t);
+ 
+	if(foot[0].t<=foot[0].arr*foot[0].cycle)
+		return  b;		
+	else 
+		return  0;
+	
+	
+}
+
+
+
+
+//运动学逆解
+void leg_angle(float x1,float y1,float length1,float length2)
+{
+   horse[0].x1 =x1;
+   horse[0].y1 =y1;
+	 horse[0].length1=length1;
+	 horse[0].length2=length2;
+	
+horse[0].shank1=pi-acosf((horse[0].x1*horse[0].x1+horse[0].y1*horse[0].y1-horse[0].length1*horse[0].length1-horse[0].length2*horse[0].length2)/((-2*horse[0].length1*horse[0].length2))); 
+/*%%%%%%%%%%%弧度转角度 %%%%%%%%%%%*/
+horse[0].shank1=180*horse[0].shank1/pi;
+	
+horse[0].fail=acosf(horse[0].x1*horse[0].x1+horse[0].y1*horse[0].y1-horse[0].length1*horse[0].length1-horse[0].length2*horse[0].length2/(2*horse[0].length1*sqrt(horse[0].x1*horse[0].x1+horse[0].y1*horse[0].y1)));
+/*%%%%%%%%%%%弧度转角度 %%%%%%%%%%%*/
+horse[0].fail=180*horse[0].fail/pi;
+
+horse[0].shank2=(180*fabs(atanf(horse[0].y1/horse[0].x1))/pi)-horse[0].fail;	//要用角度减角度（弧度与角度不能同时计算）
+	
+}   

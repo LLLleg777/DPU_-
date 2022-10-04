@@ -1,0 +1,708 @@
+/**
+  ******************************************************************************
+  * @file    pid.c
+  * @author  王正浩
+  * @version V1.0.0
+  * @date    2020/12/12
+  * @brief   对每一个pid结构体都要先进行函数的连接，再进行初始化
+  ******************************************************************************
+  * @attention
+  *
+  ******************************************************************************
+  */
+
+/* Includes ------------------------------------------------------------------*/
+#include "pid.h"
+#include "app_usart.h"
+#include "app_can.h"
+#include "math.h"
+#include "main.h"
+#include "can.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+#include "fsmc.h"
+#include "lcd.h"
+#include "pid.h"
+#include "timer.h"
+
+PID_typedef Motor_PID[8] = {0};	//初始化6个大疆电机
+
+/**********限幅函数**********/
+#define LimitMax(input, max)   \
+    {                          \
+        if (input > max)       \
+        {                      \
+            input = max;       \
+        }                      \
+        else if (input < -max) \
+        {                      \
+            input = -max;      \
+        }                      \
+    }
+
+/**
+  * @brief          pid struct data init
+  * @param[out]     pid: PID结构数据指针
+  * @param[in]      mode: PID_Speed:速度环PID  PID_Position：位置环PID
+  * @param[in]      PID: 0: in_kp, 1: in_ki, 2:in_kd 3: out_kp, 4: out_ki, 5:out_kd
+  * @param[in]      max_out: 0: 内环pid最大输出 1：外环pid最大输出
+  * @param[in]      max_idout: 0：内环pid最大积分输出 1：外环最大微分输出
+	* @param[in]      deadband: 外环死区
+  * @retval         none
+  */
+void PID_motoinit(PID_typedef *pid, u8 mode,  fp32 PID[6], fp32 max_out[2], fp32 max_idout[2], fp32 deadband)
+{
+    //内环初始化
+    pid->mode = mode;
+    pid->in_Kp = PID[0];
+    pid->in_Ki = PID[1];
+    pid->in_Kd = PID[2];
+    pid->in_max_out = max_out[0];
+    pid->in_max_iout = max_idout[0];
+    pid->in_Dbuf[0] = pid->in_Dbuf[1] = pid->in_Dbuf[2] = 0.0f;
+    pid->in_err[0] = pid->in_err[1] = pid->in_err[2] = pid->in_Pout = pid->in_Iout = pid->in_Dout = pid->in_out = 0.0f;
+    //外环初始化
+    pid->out_Kp = PID[3];
+    pid->out_Ki = PID[4];
+    pid->out_Kd = PID[5];
+    pid->out_max_out = max_out[1];
+    pid->out_max_dout = max_idout[1];
+    pid->deadband = deadband;
+    pid->out_Dbuf[0] = pid->out_Dbuf[1] = pid->out_Dbuf[2] = 0.0f;
+    pid->out_err[0] = pid->out_err[1] = pid->out_err[2] = pid->out_Pout = pid->out_Iout = pid->out_Dout = pid->out_out = 0.0f;
+}
+
+/**
+  * @funNm  PID_motoloop
+  * @brief  PID闭环
+  * @param	speed:期望速度（是尾转转速，要换算成rad/s，之前用的都是rad/min）
+  * @param	Pos:期望位置（一定要是角度值，如要转两圈，值就是720）	  * @param	deadband:死区（只有用位置环才需要死区，该死区指的是度数，如死区为2，即在2度误差内不做调整）
+  * @retval 串级PID计算后的值
+*/
+fp32 PID_motoloop(PID_typedef *pid, motor_measure_t*ptr, fp32 setspeed, fp32 setpos)
+{
+    if(pid->mode == 1)
+    {
+        pid->out_max_out = setspeed;//将外环总输出限制设置为期望速度，因为外环计算出的就是速度值
+        pid->out_err[2] = pid->out_err[1];//增量式PID要用到上上次的误差值，位置式PID不用，此参数是无用的；
+        pid->out_err[1] = pid->out_err[0];//外环上一次误差
+        pid->out_set = setpos;          //期望位置
+        pid->out_get = ptr->real_angle; //实际位置（要将编码器值8192换算成360°，方便计算）
+        pid->out_err[0] = pid->out_set - pid->out_get;
+
+        if(fabs(pid->out_err[0]) < pid->deadband) //死区内，不做计算
+            return 0;
+
+        pid->out_Pout = pid->out_Kp * pid->out_err[0];                   //Pout
+        LimitMax(pid->out_Pout, pid->out_max_out);
+        pid->out_Iout += pid->out_Ki * pid->out_err[0];                   //Iout
+        pid->out_Dout = pid->out_Kd * (pid->out_err[0] - pid->out_err[1]); //Dout
+        LimitMax(pid->out_Dout, pid->out_max_dout);
+        pid->out_out = pid->out_Pout + pid->out_Iout + pid->out_Dout;
+
+        pid->in_err[2] = pid->in_err[1];                                    //内环的上上次误差
+        pid->in_err[1] = pid->in_err[0];                                    //内环上一次误差
+        pid->in_set = pid->out_out;                                      //外环的输出值 = 内环的输入值 = 期望速度
+        pid->in_get = ptr->speed / 60.0f;                /*有改动*/       //实际速度(注意这里将转速值处理成了rad/s,之前是rad/min)
+        pid->in_err[0] = pid->in_set - pid->in_get;                         //速度误差
+        pid->in_Pout =  pid->in_Kp * pid->in_err[0];
+        pid->in_Iout += pid->in_Ki * pid->in_err[0];
+        pid->in_Dout =  pid->in_Kd * (pid->in_err[0] - pid->in_err[1]);
+        LimitMax(pid->in_Iout, pid->in_max_iout);
+        pid->in_out = pid->in_Pout + pid->in_Iout + pid->in_Dout;
+        LimitMax(pid->in_out, pid->in_max_out);
+    }
+    else
+    {
+        pid->in_err[2] = pid->in_err[1];                                  //内环的上上次误差
+        pid->in_err[1] = pid->in_err[0];                                  //内环上一次误差
+        pid->in_set = setspeed ;                                    //外环的输出值 = 内环的输入值 = 期望速度
+        pid->in_get = ptr->speed / 60.0f;                /*有改动*/       //实际速度(注意这里将转速值处理成了rad/s,之前是rad/min)
+        pid->in_err[0] = pid->in_set - pid->in_get;                         //速度误差
+        pid->in_Pout =  pid->in_Kp * pid->in_err[0];
+        pid->in_Iout += pid->in_Ki * pid->in_err[0];
+        pid->in_Dout =  pid->in_Kd * (pid->in_err[0] - pid->in_err[1]);
+        LimitMax(pid->in_Iout, pid->in_max_iout);
+        pid->in_out = pid->in_Pout + pid->in_Iout + pid->in_Dout;
+        LimitMax(pid->in_out, pid->in_max_out);
+    }
+    return pid->in_out;
+}
+
+
+pid loop[10];
+
+
+
+//float Velo_p=8.2f,Velo_i=0.115f,Velo_d=0.001f;    单速度环参数
+
+
+
+
+//////////////////////////////////////////////////偶合//////////////////////////////////////////////////////////////////
+
+float Vertical_Init2(float MMed,float Angle,float gyro_X,float deadhead)//期望角度  实际角度  x角速度  死区
+{
+    loop[4].err= MMed-Angle;
+
+    if(fabs(loop[4].err)<deadhead)
+    {
+
+        return 0;
+
+    }
+
+    else
+    {
+
+        loop[4].Pout=kp4*loop[4].err;
+
+        loop[4].Iout+=ki4*loop[4].err;
+
+        loop[4].Iout=loop[4].Iout>2000?2000:(loop[4].Iout<(-2000)?(-2000):loop[4].Iout);
+
+        loop[4].Dout=kd4*(gyro_X-0);
+
+        loop[4].output=loop[4].Pout+loop[4].Dout+loop[4].Iout;
+
+        if(fabs(angle.Roll)>40)
+        {
+
+            return 0;
+
+        }
+
+        loop[4].output= loop[4].output>8000?8000:( loop[4].output<(-8000)?(-8000): loop[4].output);
+        return loop[4].output;
+
+    }
+
+}
+
+
+float Velocity_NEW(float motor_left,float motor_right,float Setspeed)
+{
+    motor_left=m3508[0].speed;
+    motor_right=m3508[1].speed;
+
+    loop[5].err=loop[5].err_last;
+    loop[5].err=Setspeed-(motor_left-motor_right);
+
+    loop[5].Pout=loop[5].err*kp5;
+    loop[5].Pout=loop[5].Pout>8000?8000:(loop[5].Pout<(-8000)?(-8000):loop[5].Pout);
+
+    loop[5].Iout+=loop[5].err*ki5;
+    loop[5].Iout=loop[5].Iout>8000?8000:(loop[5].Iout<(-8000)?(-8000):loop[5].Iout);
+
+    loop[5].Dout=(loop[5].err-loop[5].err_last)*kd5;
+
+    loop[5].output=loop[5].Dout+loop[5].Iout+loop[5].Pout;
+
+    return loop[5].output;
+
+}
+
+
+
+
+
+
+/************************转向环***************************/
+float Turn_Corner(float exturn,float angle,float groy)  //z
+{
+
+    loop[3].err_last=loop[3].err;
+    loop[3].err=exturn-angle;
+
+    if(loop[3].err>180)
+    {
+        loop[3].err=loop[3].err-360;
+    }
+    if(loop[3].err<-180)
+    {
+        loop[3].err=loop[3].err+360;
+    }
+
+    loop[3].Pout=kp3*loop[3].err;
+
+    loop[3].Iout+=ki3*loop[3].err;
+
+    loop[3].Dout=kd3*(groy-0);
+
+    loop[3].output=loop[3].Pout+loop[3].Iout+loop[3].Dout;
+
+    loop[3].output=loop[3].output>4000?4000:(loop[3].output<(-4000)?(-4000):loop[3].output);
+
+    return loop[3].output;
+
+}
+
+/////////////////////////////////////////////////耦合/////////////////////////////////////////////////////////////////
+
+
+
+
+
+/****************************角速度环*****************************/
+
+float  Angular_Kp=4.0f;
+float  Angular_Ki=0.0f;
+float  Angular_Kd=0.20f;
+
+float  Angular_Velocity(float ex,float Angular,float Angular_plus )  //期望角速度 实际 角加速度  ex=直立环输出
+{
+    float err,Angular_Pout,Angular_Iout,Angular_Dout,Angular_Out;
+
+    err=ex-Angular;
+
+    Angular_Pout=err*Angular_Kp;
+
+    Angular_Iout+=err*Angular_Ki;
+
+    Angular_Dout= Angular_Kd*(Angular_plus-0);
+
+    Angular_Out=Angular_Pout+Angular_Iout+Angular_Dout;
+
+    return Angular_Out;
+
+}
+
+
+
+/**
+  * @funNm  PID_angleloop
+  * @brief  PID串级角度闭环
+  * @param	mode:是否使用外环，true(1)为使用，false(0)为不使用。
+  * @param	speed:期望角速度
+  * @param	Pos:期望角度
+  * @param	deadband:死区（只有用位置环才需要死区，该死区指的是度数，如死区为2，即在2度误差内不做调整）
+  * @retval 串级PID计算后的值
+  */
+
+
+float PID_angleloop2(u8 mode,float anglespeed,float Roll,float deadband)//模式  yaw=中值 x
+/****************未限幅*****************/
+{
+    if(mode==1)
+    {
+        loop[0].err_last=loop[0].err;
+
+        loop[0].SetYaw=Roll;
+
+        loop[0].ActualYaw=angle.Roll;
+
+        loop[0].err=loop[0].SetYaw-loop[0].ActualYaw;
+
+        if(fabs(loop[0].err) < deadband)                           //死区内，不做计算
+            return 0;
+
+        loop[0].Pout=kp2*loop[0].err;
+
+        loop[0].Iout+=ki2*loop[0].err;
+
+        loop[0].Dout=(loop[0].err-loop[0].err_last)*kd2;
+
+        loop[0].output=loop[0].Pout+loop[0].Iout+loop[0].Dout;
+
+        loop[1].SetAngleSpeed=loop[0].output;
+
+        loop[1].ActualAngleSpeed=angle.Rollspeed;
+
+        loop[1].err_last=loop[1].err;
+
+        loop[1].err=loop[1].SetAngleSpeed-loop[1].ActualAngleSpeed;
+
+        loop[1].Pout=kp1*loop[1].err;
+
+        loop[1].Iout+=ki1*loop[1].err;
+
+        loop[1].Dout=kd1*(loop[1].err-loop[1].err_last);
+
+        loop[1].output=loop[1].output=loop[1].Pout+loop[1].Iout+loop[1].Dout;
+
+    }
+
+    else
+    {
+        loop[1].SetAngleSpeed=anglespeed;
+
+        loop[1].ActualAngleSpeed=angle.Rollspeed;
+
+        loop[1].err_last=loop[1].err;
+
+        loop[1].err=loop[1].SetAngleSpeed-loop[1].ActualAngleSpeed;
+
+        loop[1].Pout=kp1*loop[1].err;
+
+        loop[1].Iout+=ki1*loop[1].err;
+
+        loop[1].Dout=kd1*(loop[1].err-loop[1].err_last);
+
+        loop[1].output=loop[1].output=loop[1].Pout+loop[1].Iout+loop[1].Dout;
+
+
+    }
+    return loop[1].output;
+}
+
+
+
+/**
+  * @funNm  PID_balance
+  * @brief  PID串级直立速度闭环
+  * @param	mode:1为使用外环输出3508【0】。
+  * @param	mode:2为不使用外环输出3508【0】。
+  * @param	mode:3为使用外环输出3508【1】。
+  * @param	mode:4为不使用外环输出3508【1】。
+  * @param	:期望速度
+  * @param	:期望角度
+  * @retval 串级PID计算后的值
+*/
+
+
+
+/***********************模式*******中直*****期望速度******陀螺仪角速度x******期望角度z,*****陀螺仪角加速度z***/
+float PID_balance_id(u8 mode,float Med,float speed, float anglespeed,float angle_z,float angleplusspeed_z)
+{   /****************未限幅*****************/
+    if(mode==1)
+    {
+        loop[2].SetLine=Med;
+
+        loop[2].ActualLine=angle.Roll;
+
+        loop[2].SetAngleSpeed=anglespeed;
+
+        loop[2].err=loop[2].SetLine-loop[2].ActualLine;
+
+        loop[2].Pout=loop[2].err*kp4;
+
+        loop[2].Iout+=loop[2].err*ki4;
+
+        loop[2].Dout=(loop[2].SetAngleSpeed-0)*kd4;
+
+        loop[2].output=loop[2].Pout+loop[2].Iout+loop[2].Dout;
+
+
+        loop[4].SetLine=angle_z;
+
+        loop[4].ActualLine=angle.Yawspeed;
+
+        loop[4].SetAngleSpeed=angleplusspeed_z;
+
+        loop[4].err=loop[4].SetLine-loop[4].ActualLine;
+
+        loop[4].Pout=loop[4].err*kp3;
+
+        loop[4].Iout+=loop[4].err*ki3;
+
+        loop[4].Dout=(loop[4].SetAngleSpeed-0)*kd3;
+
+        loop[4].output=loop[4].Pout+loop[4].Iout+loop[4].Dout;
+
+        loop[3].SetSpeed=loop[2].output+ loop[4].output;
+
+        loop[3].ActualSpeed=m3508[0].speed;
+
+        loop[3].err_last=loop[3].err;
+
+        loop[3].err=loop[3].SetSpeed-loop[3].ActualSpeed;
+
+        loop[3].Pout=loop[3].err*kp5;
+
+        loop[3].Iout+=loop[3].err*ki5;
+
+        loop[3].Dout=(loop[3].err-loop[3].err_last)*kd5;
+
+        loop[3].output=loop[3].Pout+loop[3].Iout+loop[3].Dout;
+
+    }
+
+    else if(mode==2)
+    {
+        loop[3].SetSpeed=speed;
+
+        loop[3].ActualSpeed=m3508[0].speed;
+
+        loop[3].err_last=loop[3].err;
+
+        loop[3].err=loop[3].SetSpeed-loop[3].ActualSpeed;
+
+        loop[3].Pout=loop[3].err*kp5;
+
+        loop[3].Iout+=loop[3].err*ki5;
+
+        loop[3].Dout=(loop[3].err-loop[3].err_last)*kd5;
+
+        loop[3].output=loop[3].Pout+loop[3].Iout+loop[3].Dout;
+
+    }
+
+
+    else if(mode==3)
+    {
+        loop[2].SetLine=Med;
+
+        loop[2].ActualLine=angle.Rollspeed;
+
+        loop[2].SetAngleSpeed=anglespeed;
+
+        loop[2].err=loop[2].SetLine-loop[2].ActualLine;
+
+        loop[2].Pout=loop[2].err*kp4;
+
+        loop[2].Iout+=loop[2].err*ki4;
+
+        loop[2].Dout=(loop[2].SetAngleSpeed-0)*kd4;
+
+        loop[2].output=loop[2].Pout+loop[2].Iout+loop[2].Dout;
+
+
+
+        loop[4].SetLine=angle_z;
+
+        loop[4].ActualLine=angle.Yawspeed;
+
+        loop[4].SetAngleSpeed=angleplusspeed_z;
+
+        loop[4].err=loop[4].SetLine-loop[4].ActualLine;
+
+        loop[4].Pout=loop[4].err*kp3;
+
+        loop[4].Iout+=loop[4].err*ki3;
+
+        loop[4].Dout=(loop[4].SetAngleSpeed-0)*kd3;
+
+        loop[4].output=loop[4].Pout+loop[4].Iout+loop[4].Dout;
+
+        loop[3].SetSpeed=-loop[2].output-loop[4].output;
+
+        loop[3].ActualSpeed=m3508[1].speed;
+
+        loop[3].err_last=loop[3].err;
+
+        loop[3].err=loop[3].SetSpeed-loop[3].ActualSpeed;
+
+        loop[3].Pout=loop[3].err*kp5;
+
+        loop[3].Iout+=loop[3].err*ki5;
+
+        loop[3].Dout=(loop[3].err-loop[3].err_last)*kd5;
+
+        loop[3].output=loop[3].Pout+loop[3].Iout+loop[3].Dout;
+
+
+    }
+
+    else if(mode==4)
+    {
+        loop[3].SetSpeed=speed;
+
+        loop[3].ActualSpeed=m3508[1].speed;
+
+        loop[3].err_last=loop[3].err;
+
+        loop[3].err=loop[3].SetSpeed-loop[3].ActualSpeed;
+
+        loop[3].Pout=loop[3].err*kp5;
+
+        loop[3].Iout+=loop[3].err*ki5;
+
+        loop[3].Dout=(loop[3].err-loop[3].err_last)*kd5;
+
+        loop[3].output=loop[3].Pout+loop[3].Iout+loop[3].Dout;
+
+    }
+
+    return loop[3].output;
+
+}
+
+
+fp32 PID_motoloop_z(fp32 set_anglespeed, fp32 set_angle,fp32 deadhead)
+{
+    float max,set,get,in_set,in_get;
+
+    max = set_anglespeed;//将外环总输出限制设置为期望速度，因为外环计算出的就是速度值
+
+    loop[6].err_last2= loop[6].err_last;
+    loop[6].err_last=loop[6].err;
+
+    set = set_angle;          //期望角度
+    get = angle.Yaw;          //实际角度
+    loop[6].err= set - get;
+
+    loop[6].Pout = kp1 *loop[6].err;                   //Pout
+
+    loop[6].Iout += ki1 * loop[6].err;                   //Iout
+
+    loop[6].Dout = kd1 * (loop[6].err-loop[6].err_last); //Dout
+
+    loop[6].output = loop[6].Pout+loop[6].Iout+ loop[6].Dout;
+
+    loop[6].output=loop[6].output>max?max:(loop[6].output<(-max)?(-max):loop[6].output);
+
+
+    loop[7].err_last2= loop[7].err_last;   //内环的上上次误差
+
+    loop[7].err_last=loop[7].err;          //内环上一次误差
+
+    in_set =loop[6].output;                                      //外环的输出值 = 内环的输入值 = 期望速度
+
+    in_get = angle.Yawspeed;                /*有改动*/       //实际速度(注意这里将转速值处理成了rad/s,之前是rad/min)
+
+    loop[7].err = in_set -in_get;                         //速度误差
+
+    if(fabs(loop[7].err)<=deadhead)
+
+        return 0;
+
+
+    loop[7].Pout = kp3 *loop[7].err;
+
+    loop[7].Iout += ki3 * loop[7].err;
+
+    loop[7].Dout = kd3 * (loop[7].err-loop[7].err_last); //Dout
+
+    loop[7].output = loop[7].Pout+loop[7].Iout+ loop[7].Dout;
+
+    return   loop[7].output;
+
+}
+
+
+
+
+                      //速度环pid
+float Vertical_Init(float MMed,float Angle,float gyro_X,float deadhead)//期望角度  实际角度  x角速度  死区
+{
+    loop[6].err= MMed-Angle;
+
+    if(fabs(loop[6].err)<deadhead)
+    {
+
+        return 0;
+
+    }
+
+    else
+    {
+
+        loop[6].Pout=kp6*loop[6].err;
+
+        loop[6].Iout+=ki6*loop[6].err;
+
+        loop[6].Iout=loop[6].Iout>2000?2000:(loop[6].Iout<(-2000)?(-2000):loop[6].Iout);
+
+        loop[6].Dout=kd6*(gyro_X-0);
+
+        loop[6].output=loop[6].Pout+loop[6].Dout+loop[6].Iout;
+
+        if(fabs(angle.Roll)>40)
+        {
+
+            return 0;
+
+        }
+
+        loop[6].output= loop[6].output>8000?8000:( loop[6].output<(-8000)?(-8000): loop[6].output);
+        return loop[6].output;
+
+    }
+
+}
+
+
+
+
+
+
+float Velo_p=1.0f;
+float Velo_i=0.1f;
+float Velo_d=0.0f; 
+
+float Velo1(float ex,float fact,float deadhead)
+{
+    static float err,last_err;               		                      //初始化 偏差，上一次偏差
+
+    float Velo_pout,Velo_iout,Velo_dout,Velo_out1;							//p输出，i输出，d输出，总输
+
+    err=ex-fact;
+
+    last_err=err;                         //将本次偏差 付给上次偏差
+
+    if((fabs(err)<deadhead)||(fabs(last_err)<deadhead))
+        return 0;
+
+    else if(fabs(angle.Roll )>40)
+    {
+
+        return 0;
+
+    }
+
+    else
+
+        Velo_pout=err*Velo_p;                             //
+
+    Velo_iout+=err*Velo_i;                            //
+
+//    Velo_iout=Velo_iout>2000?2000:(Velo_iout<(-2000)?(-2000):Velo_iout);
+
+    Velo_dout=(err-last_err)*Velo_d;                  //
+
+    Velo_out1=Velo_pout+Velo_iout+Velo_dout;          //
+
+    Velo_out1=Velo_out1>8000?8000:(Velo_out1<(-8000)?(-8000):Velo_out1);
+
+    return Velo_out1;
+}
+
+/**
+  * @funNm  PID_turnloop
+  * @brief  平衡车PID转向环
+  * @param	
+  * @param	
+  * @param	
+  * @retval 转向环输出
+*/
+fp32 PID_turnloop(fp32 turn_speed,fp32 turn_angle)
+{
+  //转向环外环-角度环
+
+float turn_set,turn_sets,turn_get,turn_gets,turn_outmaxw;
+
+turn_set=turn_angle;
+turn_get=angle.Yaw;
+turn_outmaxw=turn_speed;
+loop[3].err_last=loop[3].err;
+loop[3].err=turn_set-turn_get;
+
+if(fabs(loop[3].err)>180)
+loop[3].err-=360;
+  if(fabs(loop[3].err)<-180)
+   loop[3].err+=360;
+loop[3].Pout=kp3*loop[3].err;
+loop[3].Dout=kd3*(loop[3].err-loop[3].err_last);
+loop[3].output=loop[3].Pout+loop[3].Iout;
+
+turn_sets=loop[3].output;
+
+turn_gets=angle.Yawspeed;
+
+loop[8].err_last=loop[8].err;
+loop[8].err=turn_sets-turn_gets;
+loop[8].Pout=kp1*loop[8].err;
+loop[8].Iout+=ki1*loop[8].err;
+loop[8].Dout=kd1*loop[8].err;
+loop[8].output=loop[8].Pout+loop[8].Iout+loop[8].Dout;
+
+return loop[8].output;
+}
+
+
+
+
+
+
+
